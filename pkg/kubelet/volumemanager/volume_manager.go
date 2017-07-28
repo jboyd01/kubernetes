@@ -18,6 +18,7 @@ package volumemanager
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -312,7 +313,7 @@ func (vm *volumeManager) GetVolumesInUse() []v1.UniqueVolumeName {
 			}
 		}
 	}
-
+	sort.Slice(volumesToReportInUse, func(i, j int) bool { return volumesToReportInUse[i] < volumesToReportInUse[j] })
 	return volumesToReportInUse
 }
 

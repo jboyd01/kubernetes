@@ -17,6 +17,7 @@ limitations under the License.
 package volumemanager
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"strconv"
@@ -50,6 +51,54 @@ const (
 	testHostname = "test-hostname"
 )
 
+func TestGetMountedVolumesForPodAndGetMultipleVolumesInUse(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("volumeManagerTest")
+	if err != nil {
+		t.Fatalf("can't make a temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	podManager := kubepod.NewBasicPodManager(podtest.NewFakeMirrorClient(), secret.NewFakeManager(), configmap.NewFakeManager())
+
+	node, pod, pv, claim, pv2, claim2 := createMultipleObjects()
+
+	kubeClient := fake.NewSimpleClientset(node, pod, pv, claim, pv2, claim2)
+
+	manager := newTestVolumeManager(tmpDir, podManager, kubeClient)
+
+	stopCh := runVolumeManager(manager)
+	defer close(stopCh)
+
+	podManager.SetPods([]*v1.Pod{pod})
+
+	// Fake node status update
+	go simulateVolumeInUseUpdate(
+		v1.UniqueVolumeName(node.Status.VolumesAttached[0].Name),
+		stopCh,
+		manager)
+
+	go simulateVolumeInUseUpdate(
+		v1.UniqueVolumeName(node.Status.VolumesAttached[1].Name),
+		stopCh,
+		manager)
+
+	err = manager.WaitForAttachAndMount(pod)
+	if err != nil {
+		t.Errorf("Expected success: %v", err)
+	}
+
+	expectedMounted := pod.Spec.Volumes[0].Name
+	actualMounted := manager.GetMountedVolumesForPod(types.UniquePodName(pod.ObjectMeta.UID))
+	if _, ok := actualMounted[expectedMounted]; !ok || (len(actualMounted) != 1) {
+		t.Errorf("Expected %v to be mounted to pod but got %v", expectedMounted, actualMounted)
+	}
+
+	//expectedInUse := []v1.UniqueVolumeName{v1.UniqueVolumeName(node.Status.VolumesAttached[0].Name)}
+	actualInUse := manager.GetVolumesInUse()
+	fmt.Printf("volumesInUse: %v", actualInUse)
+	//if !reflect.DeepEqual(expectedInUse, actualInUse) {
+	//	t.Errorf("Expected %v to be in use but got %v", expectedInUse, actualInUse)
+	//}
+}
 func TestGetMountedVolumesForPodAndGetVolumesInUse(t *testing.T) {
 	tmpDir, err := utiltesting.MkTmpdir("volumeManagerTest")
 	if err != nil {
@@ -239,6 +288,111 @@ func newTestVolumeManager(tmpDir string, podManager pod.Manager, kubeClient clie
 
 // createObjects returns objects for making a fake clientset. The pv is
 // already attached to the node and bound to the claim used by the pod.
+func createMultipleObjects() (*v1.Node, *v1.Pod, *v1.PersistentVolume, *v1.PersistentVolumeClaim, *v1.PersistentVolume, *v1.PersistentVolumeClaim) {
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: testHostname},
+		Status: v1.NodeStatus{
+			VolumesAttached: []v1.AttachedVolume{
+				{
+					Name:       "fake/pvA",
+					DevicePath: "fake/path",
+				},
+				{
+					Name:       "fake/pvZ",
+					DevicePath: "fake/pathZ",
+				},
+			}},
+		Spec: v1.NodeSpec{ExternalID: testHostname},
+	}
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "abc",
+			Namespace: "nsA",
+			UID:       "1234",
+		},
+		Spec: v1.PodSpec{
+			Volumes: []v1.Volume{
+				{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "claimA",
+						},
+					},
+				},
+				{
+					Name: "vol2",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "claimB",
+						},
+					},
+				},
+			},
+			SecurityContext: &v1.PodSecurityContext{
+				SupplementalGroups: []int64{555},
+			},
+		},
+	}
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvA",
+		},
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{
+					PDName: "fake-device",
+				},
+			},
+			ClaimRef: &v1.ObjectReference{
+				Name: "claimA",
+			},
+		},
+	}
+	pv2 := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvB",
+		},
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{
+					PDName: "fake-device2",
+				},
+			},
+			ClaimRef: &v1.ObjectReference{
+				Name: "claimB",
+			},
+		},
+	}
+	claim := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "claimA",
+			Namespace: "nsA",
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			VolumeName: "pvA",
+		},
+		Status: v1.PersistentVolumeClaimStatus{
+			Phase: v1.ClaimBound,
+		},
+	}
+	claim2 := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "claimB",
+			Namespace: "nsB",
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			VolumeName: "pvB",
+		},
+		Status: v1.PersistentVolumeClaimStatus{
+			Phase: v1.ClaimBound,
+		},
+	}
+	return node, pod, pv, claim, pv2, claim2
+}
+
+// createObjects returns objects for making a fake clientset. The pv is
+// already attached to the node and bound to the claim used by the pod.
 func createObjects() (*v1.Node, *v1.Pod, *v1.PersistentVolume, *v1.PersistentVolumeClaim) {
 	node := &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: testHostname},
@@ -248,6 +402,14 @@ func createObjects() (*v1.Node, *v1.Pod, *v1.PersistentVolume, *v1.PersistentVol
 					Name:       "fake/pvA",
 					DevicePath: "fake/path",
 				},
+				// {
+				// 	Name:       "fake/pvZ",
+				// 	DevicePath: "fake/pathZ",
+				// },
+				// {
+				// 	Name:       "fake/pvB",
+				// 	DevicePath: "fake/pathB",
+				// },
 			}},
 		Spec: v1.NodeSpec{ExternalID: testHostname},
 	}
